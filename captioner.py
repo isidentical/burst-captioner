@@ -1,11 +1,19 @@
 import time
-import webdataset as wds
 from argparse import ArgumentParser
-from rich.progress import track
+
 import braceexpand
+import webdataset as wds
 from PIL import Image
-from lmdeploy import pipeline, TurbomindEngineConfig, ChatTemplateConfig, GenerationConfig
+from rich.progress import track
+
+from lmdeploy import (
+    pipeline,
+    TurbomindEngineConfig,
+    ChatTemplateConfig,
+    GenerationConfig,
+)
 from lmdeploy.messages import Response
+
 
 PROMPT = """\
 Can you please describe this image in up to two paragraphs? Please specify any objects within the image,
@@ -18,7 +26,7 @@ speculation about the things that are not part of the image such as "the image i
 makes you feel joy". DO NOT add things such as "creates a unique and entertaining visual", as these descriptions are
 interpretations and not a part of the image itself. The description should be purely factual, with no subjective speculation.
 Make sure to include the style of the image, for example cartoon, photograph, 3d render etc. Start with the words
-‘This image showcases’:
+'This image showcases':
 """
 
 GENERATION_CONFIG = GenerationConfig(
@@ -33,7 +41,9 @@ pipe = pipeline(
 )
 
 
-def recaption(images: list[Image.Image], metadata: list[dict[str, str]]) -> list[Response]:
+def recaption(
+    images: list[Image.Image], metadata: list[dict[str, str]]
+) -> list[Response]:
     prompts = []
     for image, image_meta in zip(images, metadata):
         if caption := image_meta.get("caption"):
@@ -47,10 +57,18 @@ def recaption(images: list[Image.Image], metadata: list[dict[str, str]]) -> list
     return response
 
 
+def apply_filters(data):
+    for key, jpg, json in data:
+        if jpg.size < (256, 256):
+            continue
+
+        yield (key, jpg, json)
+
+
 def main():
     parser = ArgumentParser()
     parser.add_argument("--num-workers", type=int, default=1)
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("url")
 
     args = parser.parse_args()
@@ -60,7 +78,8 @@ def main():
         wds.tarfile_to_samples(handler=wds.warn_and_continue),
         wds.decode("pil", handler=wds.ignore_and_continue),
         wds.to_tuple("__key__", "jpg", "json"),
-        wds.batched(batchsize=32),
+        apply_filters,
+        wds.batched(batchsize=args.batch_size),
     )
 
     t0 = t1 = time.perf_counter()
@@ -71,12 +90,13 @@ def main():
         t1 = time.perf_counter()
         total_toks = 0
         for caption in captions:
-            print(caption.text)
             total_toks += caption.generate_token_len
+
         print("Took: ", t1 - t0, "to caption", len(keys))
         print("image/gpu/s: ", len(keys) / (t1 - t0))
         print("out tok/gpu/s:", total_toks / (t1 - t0))
         print("avg caption toks: ", total_toks / len(captions))
+        print("captioned: ", keys)
         continue
 
 
