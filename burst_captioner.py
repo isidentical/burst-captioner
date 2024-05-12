@@ -65,7 +65,7 @@ def wds_init(fs: fsspec.AbstractFileSystem):
     gopen_schemes["s3"] = gopen_s3_python
 
 
-def exists_fn(
+def extract_alt_fn(
     fs: fsspec.AbstractFileSystem,
     wds_file: str,
     metadata_file: str,
@@ -73,19 +73,14 @@ def exists_fn(
     import webdataset as wds
 
     wds_init(fs)
-    dataset = (
-        wds.WebDataset(fs.unstrip_protocol(wds_file))
-        .decode("pil", handler=wds.ignore_and_continue)
-        .to_tuple("__key__", "jpg", "json")
-        .select(lambda items: items[1].size >= (256, 256))
-        .batched(batchsize=32)
-    )
+    dataset = wds.WebDataset(fs.unstrip_protocol(wds_file)).decode().to_tuple("json")
 
-    num_samples = 0
-    for keys, jpgs, jsons in dataset:
-        num_samples += len(keys)
+    alt_texts = []
+    for (metadata,) in dataset:
+        alt_texts.append(metadata.get("caption"))
 
-    print(f"Found {num_samples} samples in {wds_file}.")
+    print(f"Found {len(alt_texts)} samples in {wds_file}.")
+    fs.write_text(metadata_file, json.dumps(alt_texts))
 
 
 def caption_fn(
@@ -109,15 +104,15 @@ def run_event_loop(
     if num_workers == 1:
         executor = cf.ThreadPoolExecutor(max_workers=num_workers)
     else:
-        executor = cf.ProcessPoolExecutor( # type: ignore
+        executor = cf.ProcessPoolExecutor(  # type: ignore
             max_workers=num_workers,
             mp_context=mp.get_context("spawn"),
         )
 
-    if action == "exists":
-        action_fn = exists_fn
+    if action == "extract_alt":
+        action_fn, target_ext = extract_alt_fn, ".json"
     elif action == "caption":
-        action_fn = caption_fn
+        action_fn, target_ext = caption_fn, ".json"
     else:
         raise ValueError(f"Unknown action: {action}")
 
@@ -130,7 +125,11 @@ def run_event_loop(
                     break
 
                 fs_path = wds_paths.pop()
-                metadata_file = os.path.join(metadata_dir, os.path.basename(fs_path))
+                fs_path_name, _ = os.path.splitext(fs_path)
+                metadata_file = os.path.join(
+                    metadata_dir,
+                    f"{os.path.basename(fs_path_name)}{target_ext}",
+                )
 
                 future = executor.submit(
                     action_fn,
@@ -146,7 +145,8 @@ def run_event_loop(
                 try:
                     future.result()
                 except Exception as e:
-                    console.print(f"Error processing {fs_path}: {e}")
+                    console.print(f"Error processing {fs_path}: {e}", style="red")
+                    console.print_exception()
                 else:
                     state.shards.add(fs_path)
                     fs.write_text(
@@ -169,7 +169,7 @@ def main():
     parser.add_argument(
         "--action",
         type=str,
-        choices=["exists", "caption"],
+        choices=["extract_alt", "caption"],
         required=True,
         help="Action to perform.",
     )
