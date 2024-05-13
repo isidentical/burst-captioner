@@ -2,13 +2,18 @@ import os
 import json
 import argparse
 import fsspec
+import subprocess
 import braceexpand
+import tempfile
 import concurrent.futures as cf
 import multiprocessing as mp
 from rich.progress import Progress
 from rich.console import Console
 from dataclasses import dataclass, field
 
+
+WDS_TMP_DIR = os.path.join(tempfile.gettempdir(), "wds-data")
+os.makedirs(WDS_TMP_DIR, exist_ok=True)
 
 @dataclass
 class State:
@@ -21,48 +26,39 @@ class State:
         return json.dumps(data)
 
 
-def wds_init(fs: fsspec.AbstractFileSystem):
-    import functools
-    import boto3
-    import boto3.session
-    from webdataset import gopen_schemes
-    from urllib.parse import urlparse
+@dataclass
+class StramingS3File:
+    url: str
+    tmp_file: str | None = None
+    stream: object | None = None
 
-    @functools.cache
-    def build_s3_client():
-        creds_file = os.path.expanduser("~/.config/fsspec/s3.json")
-        with open(creds_file) as f:
-            config = json.load(f)
-        config = config["s3"]["client_kwargs"]
-        s3_client = boto3.client(
-            service_name="s3",
-            endpoint_url=config["endpoint_url"],
-            aws_access_key_id=config["aws_access_key_id"],
-            aws_secret_access_key=config["aws_secret_access_key"],
-            config=boto3.session.Config(
-                retries={"max_attempts": 10, "mode": "standard"}
-            ),
+    def __enter__(self):
+        fd, self.tmp_file = tempfile.mkstemp(dir=WDS_TMP_DIR)
+        subprocess.check_call(
+            ["s5cmd", "cat", self.url],
+            stdout=fd,
         )
-        return s3_client
+        os.close(fd)
+        self.stream = open(self.tmp_file, "rb")
+        return self.stream
 
+    def __exit__(self, exc_type, exc_value, traceback):
+        assert self.tmp_file is not None
+        os.remove(self.tmp_file)
+        self.stream.close() # type: ignore
+
+
+
+def wds_init():
+    import webdataset.gopen as wds_gopen
     def gopen_s3_python(url, mode="rb", bufsize=8192):
-        """Open a URL with an S3 client.
-
-        :param url: url (s3://)
-        """
-        storage_client = build_s3_client()
-
-        parsed_url = urlparse(url)
-        if parsed_url.scheme != "s3":
+        if not url.startswith("s3://"):
             raise ValueError("gopen_s3_python only works with s3:// urls")
 
-        bucket_name = parsed_url.netloc
-        blob_name = parsed_url.path.removeprefix("/")
+        assert mode == "rb"
+        return StramingS3File(url)
 
-        data = storage_client.get_object(Bucket=bucket_name, Key=blob_name)
-        return data["Body"]
-
-    gopen_schemes["s3"] = gopen_s3_python
+    wds_gopen.gopen_schemes["s3"] = gopen_s3_python
 
 
 def extract_alt_fn(
@@ -72,7 +68,7 @@ def extract_alt_fn(
 ) -> None:
     import webdataset as wds
 
-    wds_init(fs)
+    wds_init()
     dataset = wds.WebDataset(fs.unstrip_protocol(wds_file)).decode().to_tuple("json")
 
     alt_texts = []
